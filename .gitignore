@@ -1,0 +1,14 @@
+# Diagnostic dumps. These are redacted of credentials, but still contain
+# children's names lengths, dates of birth, family/school UUIDs and addresses.
+# Keep them local.
+procare-diagnostics*.json
+
+# Downloaded media and run manifests, if anyone points the tool at the repo.
+procare-manifest*.json
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.mov
+*.heic
+!docs/**
