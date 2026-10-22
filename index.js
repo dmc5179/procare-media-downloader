@@ -173,6 +173,22 @@
     };
 
     /**
+     * A URL's host and path with the query string dropped. For signed media
+     * links that's the underlying object key, which stays the same across
+     * requests even though the signature doesn't.
+     * @param {string} url
+     * @returns {string}
+     */
+    const urlPath = (url) => {
+        try {
+            const u = new URL(url, location.origin);
+            return `${u.host}${u.pathname}`;
+        } catch {
+            return String(url).split("?")[0];
+        }
+    };
+
+    /**
      * Pulls a file extension off a URL, ignoring query strings and signatures.
      * @param {string} url
      * @param {string} fallback
@@ -534,6 +550,12 @@
 
         return {
             url: found.url,
+            // Stable identities for "have we already got this?". The URL
+            // itself is useless for that: it's a signed link, so the query
+            // string changes on every request and differs between feeds. The
+            // media id and the bare object path don't.
+            id: id != null ? String(id) : null,
+            path: urlPath(found.url),
             kid: kid.name,
             source,
             // Child name is in the filename as well as the folder so the flat
@@ -1031,7 +1053,7 @@
             const manifestName = `procare-manifest_${new Date().toISOString().slice(0, 10)}.json`;
 
             const tally = { saved: 0, skipped: 0, failed: 0, cors: 0, gone: 0 };
-            const seenUrls = new Set();
+            const seenKeys = new Set();
             let found = 0;
 
             progressEl.max = windows.length;
@@ -1062,11 +1084,13 @@
                 });
 
                 // The two feeds overlap heavily - the same photo usually
-                // appears in both - so dedupe on URL before downloading.
+                // appears in both. Dedupe on stable keys (media id, bare object
+                // path), never the full URL: its signature differs per feed.
                 const items = [];
                 for (const item of batches.flat()) {
-                    if (seenUrls.has(item.url)) continue;
-                    seenUrls.add(item.url);
+                    const keys = [item.id && `id:${item.id}`, `path:${item.path}`].filter(Boolean);
+                    if (keys.some((k) => seenKeys.has(k))) continue;
+                    keys.forEach((k) => seenKeys.add(k));
                     items.push(item);
                 }
                 if (items.length === 0) continue;
