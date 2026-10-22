@@ -12,3 +12,7 @@ procare-manifest*.json
 *.mov
 *.heic
 !docs/**
+
+# Sync ledger. Not sensitive like the diagnostics, but it's per-account
+# state and belongs with your downloads, not in the repo.
+procare-ledger.json

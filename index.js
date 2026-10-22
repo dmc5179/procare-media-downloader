@@ -58,6 +58,19 @@
         dateWindowMonths: 1,
         /** Delay between anchor-tag downloads when the folder picker isn't available. */
         anchorDownloadDelayMs: 250,
+        /**
+         * Sync ledger, kept in the root of the output folder. Records every
+         * photo already downloaded, so you can move or delete the files (say,
+         * after uploading them elsewhere) without them being fetched again.
+         * Keep this file; delete it to start over.
+         */
+        ledgerFile: "procare-ledger.json",
+        /**
+         * Incremental runs start this many days before the last sync, to
+         * catch photos the school posted late. The ledger stops any of the
+         * overlap from downloading twice.
+         */
+        syncOverlapDays: 3,
 
         /**
          * Media URL fields on an activity payload, best quality first.
@@ -629,6 +642,24 @@
             await writable.write(blob);
             await writable.close();
         }
+
+        /**
+         * Reads the sync ledger from the root of the chosen folder.
+         * @returns {Promise<?string>} raw JSON, or null if there isn't one.
+         */
+        async readState() {
+            try {
+                const handle = await this.root.getFileHandle(CONFIG.ledgerFile);
+                return await (await handle.getFile()).text();
+            } catch {
+                return null;
+            }
+        }
+
+        /** @param {string} json */
+        async writeState(json) {
+            await this.writeToRoot(CONFIG.ledgerFile, new Blob([json], { type: "application/json" }));
+        }
     }
 
     /**
@@ -665,6 +696,20 @@
             // Revoking immediately can cancel the download mid-flight in Chrome.
             setTimeout(() => URL.revokeObjectURL(href), 60_000);
         }
+
+        // There's no folder we can read back from, so the ledger lives in this
+        // site's localStorage instead. It survives page reloads, but not
+        // clearing site data or switching browsers.
+
+        /** @returns {Promise<?string>} */
+        async readState() {
+            return localStorage.getItem(`procare-excavator:${CONFIG.ledgerFile}`);
+        }
+
+        /** @param {string} json */
+        async writeState(json) {
+            localStorage.setItem(`procare-excavator:${CONFIG.ledgerFile}`, json);
+        }
     }
 
     /**
@@ -681,6 +726,118 @@
             console.warn("[procare] folder picker unavailable, falling back to downloads:", err);
             return new AnchorWriter();
         }
+    };
+
+    // ---------------------------------------------------------------------
+    // Sync ledger
+    // ---------------------------------------------------------------------
+
+    /**
+     * Remembers what has already been downloaded, independent of whether the
+     * files are still on disk.
+     *
+     * Entries are keyed by media id, with the bare object path kept as a
+     * second key: either one matching means "already have it". That covers
+     * the same photo arriving through both the activity feed and the gallery
+     * under ids we haven't been able to confirm are identical.
+     *
+     * Shape on disk:
+     *   {
+     *     "version": 1,
+     *     "last_sync": "2026-10-22",          // end of the last completed run
+     *     "downloaded": {
+     *       "<media id>": { "kid": "...", "file": "...", "path": "...", "at": "<iso>" }
+     *     }
+     *   }
+     */
+    class Ledger {
+        /** @param {DirectoryWriter|AnchorWriter} writer */
+        constructor(writer) {
+            this.writer = writer;
+            this.data = { version: 1, last_sync: null, downloaded: {} };
+            this.paths = new Set();
+            this.dirty = false;
+        }
+
+        /** Loads existing state, if any. A corrupt file is reported, not overwritten blindly. */
+        async load() {
+            const raw = await this.writer.readState();
+            if (!raw) return this;
+            let parsed;
+            try {
+                parsed = JSON.parse(raw);
+            } catch (err) {
+                throw new Error(
+                    `${CONFIG.ledgerFile} exists but isn't valid JSON, so I won't touch it. ` +
+                    `Fix or remove it, then run again.`
+                );
+            }
+            this.data = {
+                version: 1,
+                last_sync: parsed.last_sync ?? null,
+                downloaded: parsed.downloaded ?? {},
+            };
+            for (const entry of Object.values(this.data.downloaded)) {
+                if (entry?.path) this.paths.add(entry.path);
+            }
+            return this;
+        }
+
+        get size() {
+            return Object.keys(this.data.downloaded).length;
+        }
+
+        get lastSync() {
+            return this.data.last_sync;
+        }
+
+        /** @param {Object} item - from toMediaItem() */
+        has(item) {
+            return (item.id != null && item.id in this.data.downloaded) || this.paths.has(item.path);
+        }
+
+        /** @param {Object} item */
+        add(item) {
+            const key = item.id ?? item.path;
+            this.data.downloaded[key] = {
+                kid: item.kid,
+                file: item.filename,
+                path: item.path,
+                at: new Date().toISOString(),
+            };
+            this.paths.add(item.path);
+            this.dirty = true;
+        }
+
+        /**
+         * Moves last_sync forward - never back, so re-running an old range to
+         * fill a gap doesn't make the next run re-scan months it already has.
+         * @param {string} date - YYYY-MM-DD
+         */
+        markSynced(date) {
+            if (!this.data.last_sync || date > this.data.last_sync) {
+                this.data.last_sync = date;
+                this.dirty = true;
+            }
+        }
+
+        async save() {
+            if (!this.dirty) return;
+            await this.writer.writeState(JSON.stringify(this.data, null, 2));
+            this.dirty = false;
+        }
+    }
+
+    /**
+     * Shifts a YYYY-MM-DD date by a number of days.
+     * @param {string} date
+     * @param {number} days
+     * @returns {string}
+     */
+    const addDays = (date, days) => {
+        const d = new Date(`${date}T00:00:00Z`);
+        d.setUTCDate(d.getUTCDate() + days);
+        return d.toISOString().slice(0, 10);
     };
 
     // ---------------------------------------------------------------------
@@ -880,7 +1037,9 @@
             display: flex; align-items: center; gap: 8px;
             padding: 3px 0; cursor: pointer;
         }
-        #${PANEL_ID} .pe-dates { display: flex; gap: 8px; margin: 4px 0 12px; }
+        #${PANEL_ID} .pe-dates { display: flex; gap: 8px; margin: 4px 0 6px; }
+        #${PANEL_ID} .pe-incremental { margin-bottom: 12px; }
+        #${PANEL_ID} .pe-hint { font-size: 11px; color: #6b7280; }
         #${PANEL_ID} .pe-dates label { flex: 1; font-size: 11px; color: #6b7280; }
         #${PANEL_ID} .pe-dates input {
             width: 100%; padding: 5px 6px; border: 1px solid #d1d5db;
@@ -920,6 +1079,10 @@
                 <label>From<input type="date" class="pe-from"></label>
                 <label>To<input type="date" class="pe-to"></label>
             </div>
+            <label class="pe-kid pe-incremental">
+                <input type="checkbox" class="pe-since" checked>
+                Only new since last sync <span class="pe-hint">(uses the ledger in the folder you pick)</span>
+            </label>
             <div class="pe-actions">
                 <button type="button" class="pe-go" disabled>Download</button>
                 <button type="button" class="pe-stop" hidden>Stop</button>
@@ -935,6 +1098,7 @@
     const kidsEl = $(".pe-kids");
     const fromEl = $(".pe-from");
     const toEl = $(".pe-to");
+    const sinceEl = $(".pe-since");
     const goEl = $(".pe-go");
     const stopEl = $(".pe-stop");
     const statusEl = $(".pe-status");
@@ -1022,8 +1186,9 @@
             return;
         }
 
-        const dateFrom = fromEl.value || "2000-01-01";
+        let dateFrom = fromEl.value || "2000-01-01";
         const dateTo = toEl.value || new Date().toISOString().slice(0, 10);
+        let ledger = null;
 
         controller = new AbortController();
         const { signal } = controller;
@@ -1037,6 +1202,21 @@
             // we need somewhere to put files before we start.
             setStatus("Choose where to save…");
             const writer = await createWriter();
+
+            ledger = await new Ledger(writer).load();
+            if (sinceEl.checked && ledger.lastSync) {
+                // Pick up a few days before the last sync to catch late posts;
+                // the ledger stops the overlap from downloading twice.
+                const resumeFrom = addDays(ledger.lastSync, -CONFIG.syncOverlapDays);
+                dateFrom = resumeFrom < dateTo ? resumeFrom : dateTo;
+                fromEl.value = dateFrom;
+            }
+            setStatus(
+                ledger.size
+                    ? `Ledger: ${ledger.size} file(s) on record, last sync ${ledger.lastSync ?? "never"}.\n` +
+                      `Checking ${dateFrom} – ${dateTo}…`
+                    : `No ledger in this folder yet - starting one. Checking ${dateFrom} – ${dateTo}…`
+            );
 
             const windows = splitDateRange(dateFrom, dateTo, CONFIG.dateWindowMonths);
             const manifest = {
@@ -1052,7 +1232,7 @@
             };
             const manifestName = `procare-manifest_${new Date().toISOString().slice(0, 10)}.json`;
 
-            const tally = { saved: 0, skipped: 0, failed: 0, cors: 0, gone: 0 };
+            const tally = { saved: 0, skipped: 0, failed: 0, cors: 0, gone: 0, known: 0 };
             const seenKeys = new Set();
             let found = 0;
 
@@ -1091,6 +1271,11 @@
                     const keys = [item.id && `id:${item.id}`, `path:${item.path}`].filter(Boolean);
                     if (keys.some((k) => seenKeys.has(k))) continue;
                     keys.forEach((k) => seenKeys.add(k));
+
+                    if (ledger.has(item)) {
+                        tally.known++;
+                        continue;
+                    }
                     items.push(item);
                 }
                 if (items.length === 0) continue;
@@ -1102,10 +1287,15 @@
                 await runPool(items, CONFIG.concurrency, async (item) => {
                     const outcome = await downloadItem(item, writer, signal);
                     tally[outcome]++;
+                    // "skipped" means the file is already on disk from before
+                    // the ledger existed - record it so it stays skipped once
+                    // the file is moved away. Gone/failed/cors stay off the
+                    // ledger so a later run gets another go at them.
+                    if (outcome === "saved" || outcome === "skipped") ledger.add(item);
                     done++;
                     setStatus(
                         `${month} (${index + 1}/${windows.length}) — ${done}/${items.length}\n` +
-                        `saved ${tally.saved} · had ${tally.skipped} · ` +
+                        `saved ${tally.saved} · had ${tally.skipped + tally.known} · ` +
                         `gone ${tally.gone} · failed ${tally.failed} · tabs ${tally.cors}`
                     );
                     return outcome;
@@ -1116,7 +1306,15 @@
                 manifest.failures.push(...items
                     .filter((item) => item.error)
                     .map(({ kid, filename, url, error }) => ({ kid, filename, url, error })));
+
+                // Checkpoint after every month so an interrupted run keeps
+                // its progress.
+                await ledger.save();
             }
+
+            // Only a run that got all the way through earns a new sync date.
+            if (!signal.aborted) ledger.markSynced(dateTo);
+            await ledger.save();
 
             progressEl.value = windows.length;
             await writer.writeToRoot(manifestName, new Blob(
@@ -1124,12 +1322,17 @@
             ));
 
             if (found === 0) {
-                setStatus(`No photos or videos found in ${dateFrom} – ${dateTo}.`);
+                setStatus(
+                    tally.known
+                        ? `Nothing new. ${tally.known} file(s) in ${dateFrom} – ${dateTo} were already downloaded.`
+                        : `No photos or videos found in ${dateFrom} – ${dateTo}.`
+                );
                 return;
             }
 
             setStatus(
-                `Done. ${tally.saved} saved, ${tally.skipped} already present, ${tally.failed} failed.` +
+                `Done. ${tally.saved} new, ${tally.skipped + tally.known} already had, ${tally.failed} failed.` +
+                `\nSynced through ${ledger.lastSync}.` +
                 (tally.gone
                     ? `\n${tally.gone} file(s) returned 403/404 - broken on Procare's side, not recoverable.`
                     : "") +
@@ -1145,6 +1348,13 @@
                 setStatus(`Error: ${err.message}`);
             }
         } finally {
+            // Best effort: a stopped or crashed run still records the files it
+            // did save, so they aren't fetched again next time.
+            try {
+                await ledger?.save();
+            } catch (err) {
+                console.warn("[procare] couldn't save the ledger:", err);
+            }
             controller = null;
             goEl.disabled = false;
             stopEl.hidden = true;

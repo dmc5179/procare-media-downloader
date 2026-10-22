@@ -73,11 +73,35 @@ ProCare's daily summary emails — see
 
 [i3]: https://github.com/JWally/procare-media-downloader/issues/3
 
-## Resuming an Interrupted Run
+## Staying Up to Date (Incremental Runs)
 
-When saving to a folder, the script checks what's already on disk and skips it.
-Re-running after a crash, a closed laptop, or a new batch of photos only
-downloads what's actually new.
+The script keeps a **ledger**, `procare-ledger.json`, in the root of the folder
+you save to. It records every photo already downloaded and the date of the last
+completed run. That means:
+
+- **You can move or delete the photos afterwards** — after uploading them to
+  Google Photos, say — and they won't be downloaded again. The ledger is the
+  record, not the files. **Keep the ledger file itself.**
+- **Daily runs only scan recent months.** With *Only new since last sync*
+  checked (the default), the run starts 3 days before the last sync, which
+  catches photos the school posted late. The ledger stops the overlap from
+  downloading twice.
+
+So the routine is: run the script, pick the same folder, click **Download**,
+upload what appeared, delete the photos. Repeat.
+
+A run that's stopped or crashes still records the files it did save, but it
+doesn't move the sync date forward — the next run re-checks that range, and the
+ledger skips what's already done. Files that came back `gone`, `failed`, or
+were opened in a tab are left off the ledger so a later run tries them again.
+
+To fill an old gap, uncheck *Only new since last sync* and set the dates by
+hand; the sync date never moves backwards. To start over completely, delete
+`procare-ledger.json`.
+
+On browsers without the folder picker (Firefox, Safari), the ledger is kept in
+the browser's local storage for the ProCare site instead. It survives reloads,
+but not clearing site data or switching browsers.
 
 ## What Else Gets Saved
 
@@ -97,6 +121,7 @@ you selected, in case you want captions, timestamps, or teacher notes later.
 | Some files opened in new tabs instead of saving | Those URLs are served without CORS headers, so JavaScript can't read them. Save them from the tab manually. Listed under `failures` in the manifest. |
 | Nothing older than ~1 year | See [Reaching Photos Older Than a Year](#reaching-photos-older-than-a-year). |
 | Videos play as audio only | Fixed — the old script saved extension-less video URLs as `.mpeg`, which makes players pick an MPEG-1 decoder. Extensions now come from the server's `Content-Type`. |
+| Photos you deleted are downloading again | The ledger is missing from the folder you picked — `procare-ledger.json` must sit in the folder's root, and you must pick that same folder each run. |
 | Downloads are slow or stall | Lower `CONFIG.concurrency` near the top of the script. |
 | Not all your children show up | Run [`diagnose.js`](./diagnose.js) (see below). |
 
